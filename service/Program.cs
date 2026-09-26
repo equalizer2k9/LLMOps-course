@@ -27,8 +27,16 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // routing (W2): поки одна модель, а треба обирати за задачею
     var model = defaultModel;  // TODO(student, W2)
 
-    // промпт (W1): захардкодив — має братися з реєстру (таблиця prompts) з версією
-    var systemPrompt = "You are a support assistant.";  // TODO(student, W1)
+    string promptVersion, systemPrompt;
+    try
+    {
+        (promptVersion, systemPrompt) = await GetActivePrompt(dbConn);
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "prompt registry unavailable");
+        return Results.Problem("Prompt registry unavailable", statusCode: 503);
+    }
 
     // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
     // TODO(student, W3)
@@ -87,7 +95,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     decimal? costUsd = null;  // TODO(student, W2)
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -96,14 +104,42 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
 app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
-app.MapGet("/prompts", () => Results.Json(new { todo = "list from prompts table" }));              // W1/W2: [ { name, version, active } ]
+// W1: усі версії, консоль сама позначає активну
+app.MapGet("/prompts", async () =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT name, version, active FROM prompts ORDER BY created_at", db);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    var list = new List<object>();
+    while (await reader.ReadAsync())
+        list.Add(new { name = reader.GetString(0), version = reader.GetString(1), active = reader.GetBoolean(2) });
+    return Results.Json(list);
+});
+
+// W1: promote і rollback — одна атомарна операція. Невідома версія → 404, стан не змінюється.
+app.MapPost("/prompts/{version}/activate", async (string version) =>
+{
+    await using var db = new NpgsqlConnection(dbConn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "UPDATE prompts SET active = (version = @v) WHERE name = 'support-system' "
+        + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db);
+    cmd.Parameters.AddWithValue("v", version);
+    var affected = await cmd.ExecuteNonQueryAsync();
+    return affected == 0
+        ? Results.NotFound(new { error = $"prompt version '{version}' not found" })
+        : Results.Ok(new { name = "support-system", version, active = true });
+});
+
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
 app.Run("http://0.0.0.0:8080");
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
-static async Task LogRequest(string conn, Guid id, string model, int latency,
+static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,
     int promptTokens, int completionTokens, decimal? cost, int status)
 {
     try
@@ -111,10 +147,11 @@ static async Task LogRequest(string conn, Guid id, string model, int latency,
         await using var db = new NpgsqlConnection(conn);
         await db.OpenAsync();
         await using var cmd = new NpgsqlCommand(
-            "INSERT INTO requests (request_id, model, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
-            + "VALUES (@id, @model, @lat, @pt, @ct, @cost, @status)", db);
+            "INSERT INTO requests (request_id, model, prompt_version, latency_ms, prompt_tokens, completion_tokens, cost_usd, status) "
+            + "VALUES (@id, @model, @pv, @lat, @pt, @ct, @cost, @status)", db);
         cmd.Parameters.AddWithValue("id", id);
         cmd.Parameters.AddWithValue("model", model);
+        cmd.Parameters.AddWithValue("pv", promptVersion);
         cmd.Parameters.AddWithValue("lat", latency);
         cmd.Parameters.AddWithValue("pt", promptTokens);
         cmd.Parameters.AddWithValue("ct", completionTokens);
@@ -123,6 +160,19 @@ static async Task LogRequest(string conn, Guid id, string model, int latency,
         await cmd.ExecuteNonQueryAsync();
     }
     catch { /* не валимо запит через лог */ }
+}
+
+static async Task<(string Version, string Body)> GetActivePrompt(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT version, body FROM prompts WHERE name = 'support-system' AND active = true "
+        + "ORDER BY created_at DESC LIMIT 1", db);
+    await using var reader = await cmd.ExecuteReaderAsync();
+    if (await reader.ReadAsync())
+        return (reader.GetString(0), reader.GetString(1));
+    return ("none", "You are an assistant.");
 }
 
 record ChatIn(string Message);

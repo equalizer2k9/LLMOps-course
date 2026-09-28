@@ -19,7 +19,10 @@ CREATE TABLE IF NOT EXISTS prompts (
     body        TEXT NOT NULL,
     active      BOOLEAN NOT NULL DEFAULT false,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (name, version)
+    PRIMARY KEY (name, version),
+    -- рівно одна активна версія на name. DEFERRED: перевірка на COMMIT, бо
+    -- атомарний UPDATE при перемиканні проходить стан «дві активні» посеред рядків.
+    CONSTRAINT one_active EXCLUDE (name WITH =) WHERE (active) DEFERRABLE INITIALLY DEFERRED
 );
 
 CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);

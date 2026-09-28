@@ -34,11 +34,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
     catch (Exception ex)
     {
-        app.Logger.LogError(ex, "prompt registry unavailable");
-        return Results.Problem("Prompt registry unavailable", statusCode: 503);
+        return RegistryUnavailable(app.Logger, ex, requestId);
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали
+    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали.
+    // promptVersion обовʼязково в ключі кешу, інакше кеш замаскує rollback.
     // TODO(student, W3)
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
@@ -107,30 +107,44 @@ app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + bu
 // W1: усі версії, консоль сама позначає активну
 app.MapGet("/prompts", async () =>
 {
-    await using var db = new NpgsqlConnection(dbConn);
-    await db.OpenAsync();
-    await using var cmd = new NpgsqlCommand(
-        "SELECT name, version, active FROM prompts ORDER BY created_at", db);
-    await using var reader = await cmd.ExecuteReaderAsync();
-    var list = new List<object>();
-    while (await reader.ReadAsync())
-        list.Add(new { name = reader.GetString(0), version = reader.GetString(1), active = reader.GetBoolean(2) });
-    return Results.Json(list);
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT name, version, active FROM prompts ORDER BY created_at", db);
+        await using var reader = await cmd.ExecuteReaderAsync();
+        var list = new List<object>();
+        while (await reader.ReadAsync())
+            list.Add(new { name = reader.GetString(0), version = reader.GetString(1), active = reader.GetBoolean(2) });
+        return Results.Json(list);
+    }
+    catch (Exception ex)
+    {
+        return RegistryUnavailable(app.Logger, ex, Guid.NewGuid());
+    }
 });
 
 // W1: promote і rollback — одна атомарна операція. Невідома версія → 404, стан не змінюється.
 app.MapPost("/prompts/{version}/activate", async (string version) =>
 {
-    await using var db = new NpgsqlConnection(dbConn);
-    await db.OpenAsync();
-    await using var cmd = new NpgsqlCommand(
-        "UPDATE prompts SET active = (version = @v) WHERE name = 'support-system' "
-        + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db);
-    cmd.Parameters.AddWithValue("v", version);
-    var affected = await cmd.ExecuteNonQueryAsync();
-    return affected == 0
-        ? Results.NotFound(new { error = $"prompt version '{version}' not found" })
-        : Results.Ok(new { name = "support-system", version, active = true });
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "UPDATE prompts SET active = (version = @v) WHERE name = 'support-system' "
+            + "AND EXISTS (SELECT 1 FROM prompts WHERE name = 'support-system' AND version = @v)", db);
+        cmd.Parameters.AddWithValue("v", version);
+        var affected = await cmd.ExecuteNonQueryAsync();
+        return affected == 0
+            ? Results.NotFound(new { error = $"prompt version '{version}' not found" })
+            : Results.Ok(new { name = "support-system", version, active = true });
+    }
+    catch (Exception ex)
+    {
+        return RegistryUnavailable(app.Logger, ex, Guid.NewGuid());
+    }
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
@@ -173,6 +187,15 @@ static async Task<(string Version, string Body)> GetActivePrompt(string conn)
     if (await reader.ReadAsync())
         return (reader.GetString(0), reader.GetString(1));
     return ("none", "You are an assistant.");
+}
+
+// БД реєстру недоступна → 503 з request_id: за ним інцидент шукається в логах сервісу
+// (у requests рядка не буде — та сама БД лежить).
+static IResult RegistryUnavailable(ILogger log, Exception ex, Guid requestId)
+{
+    log.LogError(ex, "prompt registry unavailable, request_id={RequestId}", requestId);
+    return Results.Problem("Prompt registry unavailable", statusCode: 503,
+        extensions: new Dictionary<string, object?> { ["request_id"] = requestId });
 }
 
 record ChatIn(string Message);

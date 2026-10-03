@@ -24,8 +24,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // routing (W2): ескалація -> сильна модель, решта -> дешева. Політика — у Route().
+    var model = Route(body.Message, defaultModel);
 
     string promptVersion, systemPrompt;
     try
@@ -151,6 +151,24 @@ app.MapGet("/providers", () => Results.Json(new { todo = "provider health" })); 
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
 app.Run("http://0.0.0.0:8080");
+
+// Routing-політика (W2): повернення, скарги й термінові звернення -> mock-strong,
+// бо помилка на них дорожча; решта -> mock-mini. Консервативно: хоч один маркер -> strong.
+// Маркери — UA-основи + EN, бо роутер на одній мові = половина роутера.
+// Реальна модель у MODEL -> поки без маршрутизації (gpt-5-mini/gpt-5 — наступний крок).
+//
+// fallback chain: mock-strong -> mock-mini -> контрольована помилка (503 з request_id)
+// fallback chain: mock-mini   -> контрольована помилка
+// Механізм — W4 (Тема 7). mock-strong і mock-mini ведуть на один mock-provider,
+// тож це перевірка логіки перемикання, а не справжній резерв.
+static string Route(string message, string def)
+{
+    if (def != "mock") return def;
+
+    string[] escalationMarkers = { "поверн", "терміново", "скарг", "refund", "urgent", "complain" };
+    var u = message.ToLowerInvariant();
+    return escalationMarkers.Any(m => u.Contains(m)) ? "mock-strong" : "mock-mini";
+}
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,

@@ -16,6 +16,16 @@ var dbConn = Environment.GetEnvironmentVariable("DB_CONN")
     ?? "Host=postgres;Database=llmops;Username=llmops;Password=llmops";
 var defaultModel = Environment.GetEnvironmentVariable("MODEL") ?? "mock";
 
+// Прайс (W2): USD за 1k токенів, навчальні значення.
+var prices = new Dictionary<string, (decimal InPer1K, decimal OutPer1K)>
+{
+    ["mock-mini"]   = (0.00015m, 0.0006m),
+    ["mock-strong"] = (0.0025m,  0.01m),
+};
+
+// Денний бюджет (W2). Константа — свідоме спрощення курсу. Лежить поруч із прайсом: той самий control plane.
+var budgetUsd = 5.0m;
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -23,9 +33,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
     // TODO(student, W4)
+    // budget (W2): умова з лога → дія control plane. Політика — біля Route().
+    await CheckBudget(app.Logger, dbConn, budgetUsd);
 
-    // routing (W2): поки одна модель, а треба обирати за задачею
-    var model = defaultModel;  // TODO(student, W2)
+    // routing (W2): ескалація -> сильна модель, решта -> дешева. Політика — у Route().
+    var model = Route(body.Message, defaultModel);
 
     string promptVersion, systemPrompt;
     try
@@ -57,6 +69,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var answer = "";
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
+    var hasUsage = false; // true лише коли провайдер повернув usage → вартість можна порахувати
+
     try
     {
         var response = await http.PostAsync(
@@ -81,6 +95,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         var usage = doc.RootElement.GetProperty("usage");
         promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
         completionTokens = usage.GetProperty("completion_tokens").GetInt32();
+        hasUsage = true;
     }
     catch
     {
@@ -91,8 +106,10 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
-    // cost (W2): порахувати tokens * ціна і покласти в cost_usd
-    decimal? costUsd = null;  // TODO(student, W2)
+    // cost (W2): usage → тариф моделі → cost_usd. Вартість відома лише після відповіді.
+    // null = невідомо (usage не прийшов або моделі немає в прайсі). Це не 0:
+    // 0 = «виклик нічого не коштував», легально лише для cache hit (W3).
+    var costUsd = hasUsage ? CostUsd(prices, model, promptTokens, completionTokens) : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
@@ -103,7 +120,18 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
 app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
-app.MapGet("/cost", () => Results.Json(new { todo = "sum cost_usd for today + budget" }));         // W2/W5: { today_usd, budget_usd }
+app.MapGet("/cost", async () =>
+{
+    try
+    {
+        return Results.Json(new { today_usd = await TodayCostUsd(dbConn), budget_usd = budgetUsd });
+    }
+    catch (Exception ex) // не лише NpgsqlException: якщо хост БД не резолвиться, Npgsql кидає голий SocketException
+    {
+        app.Logger.LogError(ex, "cost query failed");
+        return Results.Problem("Cost data unavailable", statusCode: 503);
+    }
+});
 // W1: усі версії, консоль сама позначає активну
 app.MapGet("/prompts", async () =>
 {
@@ -151,6 +179,73 @@ app.MapGet("/providers", () => Results.Json(new { todo = "provider health" })); 
 app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
 
 app.Run("http://0.0.0.0:8080");
+
+// Routing-політика (W2): повернення, скарги й термінові звернення -> mock-strong,
+// бо помилка на них дорожча; решта -> mock-mini. Консервативно: хоч один маркер -> strong.
+// Маркери — UA-основи + EN, бо роутер на одній мові = половина роутера.
+// Реальна модель у MODEL -> поки без маршрутизації (gpt-5-mini/gpt-5 — наступний крок).
+//
+// fallback chain: mock-strong -> mock-mini -> контрольована помилка (503 з request_id)
+// fallback chain: mock-mini   -> контрольована помилка
+// Механізм — W4 (Тема 7). mock-strong і mock-mini ведуть на один mock-provider,
+// тож це перевірка логіки перемикання, а не справжній резерв.
+//
+// budget policy (80% денного бюджету): алерт — warning у лог сервісу (у проді — черговому), маршрути не змінюємо.
+// Чому не деградація: звичайні запити й так ідуть на mock-mini, тож деградувати можна лише
+// ескалації, а там помилка (повернення, скарга) дорожча за перевитрату.
+// Чому не відсікання: підтримка без відповіді гірша за перевищення бюджету на центи.
+static string Route(string message, string def)
+{
+    if (def != "mock") return def;
+
+    string[] escalationMarkers = { "поверн", "терміново", "скарг", "refund", "urgent", "complain" };
+    var u = message.ToLowerInvariant();
+    return escalationMarkers.Any(m => u.Contains(m)) ? "mock-strong" : "mock-mini";
+}
+
+// Вартість одного виклику: вхідні й вихідні токени — кожні за своїм тарифом (за 1k).
+// Немає тарифу → null: такі рядки знаходить WHERE cost_usd IS NULL, і прайс правиться як баг.
+// Округлення до 6 знаків = NUMERIC(10,6) у requests. AwayFromZero — як round() у Postgres
+// (за замовчуванням Math.Round у .NET банківський, ToEven).
+// prices — параметром: static-функція не бачить локальних змінних зовні (CS8421).
+// Плюс це чиста функція, її легко покрити unit-тестом.
+static decimal? CostUsd(Dictionary<string, (decimal InPer1K, decimal OutPer1K)> prices,
+    string model, int promptTokens, int completionTokens)
+{
+    if (!prices.TryGetValue(model, out var p)) return null;
+    var cost = promptTokens / 1000m * p.InPer1K + completionTokens / 1000m * p.OutPer1K;
+    return Math.Round(cost, 6, MidpointRounding.AwayFromZero);
+}
+
+// Budget-політика (W2, опційно): ≥80% денного бюджету → warning у лог сервісу.
+// Той самий запит, що й /cost: плитка й алерт не можуть розійтися.
+// Пише на кожен запит понад поріг. У проді дедуплікацію робить система алертів.
+// БД недоступна → тихо виходимо: облік не блокує відповідь (/chat сам віддасть 503 на реєстрі промптів).
+static async Task CheckBudget(ILogger log, string conn, decimal budget)
+{
+    try
+    {
+        var today = await TodayCostUsd(conn);
+        if (today >= budget * 0.8m)
+            log.LogWarning("budget alert: today_usd={Today} >= 80% of budget_usd={Budget}, routing unchanged",
+                today, budget);
+    }
+    catch (Exception ex) // ширше за NpgsqlException — див. /cost
+    {
+        // облік не блокує відповідь: /chat далі сам віддасть 503 на реєстрі промптів
+        log.LogWarning(ex, "budget check skipped: cost data unavailable");
+    }
+}
+
+// Витрати за сьогодні
+static async Task<decimal> TodayCostUsd(string conn)
+{
+    await using var db = new NpgsqlConnection(conn);
+    await db.OpenAsync();
+    await using var cmd = new NpgsqlCommand(
+        "SELECT round(COALESCE(SUM(cost_usd), 0), 4) FROM requests WHERE created_at::date = CURRENT_DATE", db);
+    return (decimal)(await cmd.ExecuteScalarAsync())!;
+}
 
 // пише один рядок у requests. якщо лог впав — запит користувача все одно віддаємо.
 static async Task LogRequest(string conn, Guid id, string model, string promptVersion, int latency,

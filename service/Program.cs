@@ -126,7 +126,7 @@ app.MapGet("/cost", async () =>
     {
         return Results.Json(new { today_usd = await TodayCostUsd(dbConn), budget_usd = budgetUsd });
     }
-    catch (NpgsqlException ex)
+    catch (Exception ex) // не лише NpgsqlException: якщо хост БД не резолвиться, Npgsql кидає голий SocketException
     {
         app.Logger.LogError(ex, "cost query failed");
         return Results.Problem("Cost data unavailable", statusCode: 503);
@@ -230,7 +230,11 @@ static async Task CheckBudget(ILogger log, string conn, decimal budget)
             log.LogWarning("budget alert: today_usd={Today} >= 80% of budget_usd={Budget}, routing unchanged",
                 today, budget);
     }
-    catch (NpgsqlException) { }
+    catch (Exception ex) // ширше за NpgsqlException — див. /cost
+    {
+        // облік не блокує відповідь: /chat далі сам віддасть 503 на реєстрі промптів
+        log.LogWarning(ex, "budget check skipped: cost data unavailable");
+    }
 }
 
 // Витрати за сьогодні

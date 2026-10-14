@@ -2,6 +2,7 @@
 // (яку модель брати, коли ретраїти, скільки коштує) робимо тут.
 // MODEL=mock — дефолт, грошей не треба. MODEL=gpt-5-mini або claude-haiku + ключ у gateway/.env — реальна модель.
 
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Npgsql;
@@ -26,6 +27,11 @@ var prices = new Dictionary<string, (decimal InPer1K, decimal OutPer1K)>
 // Денний бюджет (W2). Константа — свідоме спрощення курсу. Лежить поруч із прайсом: той самий control plane.
 var budgetUsd = 5.0m;
 
+// Кеш відповідей (W3): у пам'яті процесу, живе до рестарту. Без TTL і ліміту розміру — свідоме
+// спрощення курсу; кілька реплік → винесене сховище (Redis у профілі advanced).
+var cache = new ConcurrentDictionary<string, string>();
+var cacheStats = new CacheStats(); // hit/miss — з них у W5 рахується плитка Cache-hit
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
@@ -49,9 +55,19 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         return RegistryUnavailable(app.Logger, ex, requestId);
     }
 
-    // cache (W3): перед викликом глянути в Redis — раптом вже відповідали.
-    // promptVersion обовʼязково в ключі кешу, інакше кеш замаскує rollback.
-    // TODO(student, W3)
+    // cache (W3): ключ = модель + промпт (версія і текст) + повідомлення.
+    // Промпт у ключі: promote/rollback дає інші ключі → старі відповіді недосяжні без коду інвалідації.
+    // Текст, а не лише версія: ловить і правку body «на місці» без нової версії.
+    var cacheKey = $"{model}|{promptVersion}|{systemPrompt}|{body.Message}";
+    if (cache.TryGetValue(cacheKey, out var cached))
+    {
+        Interlocked.Increment(ref cacheStats.Hits);
+        var hitLatencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
+        // виклику моделі не було: 0 токенів і cost_usd = 0 (не null) — економія видима в лозі
+        await LogRequest(dbConn, requestId, model, promptVersion, hitLatencyMs, 0, 0, 0m, 200);
+        return Results.Json(new { request_id = requestId, content = cached, tool = (string?)null, latency_ms = hitLatencyMs });
+    }
+    Interlocked.Increment(ref cacheStats.Misses);
 
     // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
     // TODO(student, W4)
@@ -70,6 +86,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     string? toolCall = null;
     int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
     var hasUsage = false; // true лише коли провайдер повернув usage → вартість можна порахувати
+    var ok = false;       // true лише коли відповідь розібрана повністю (останній рядок try)
 
     try
     {
@@ -83,9 +100,10 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
         answer = message.GetProperty("content").GetString() ?? "";
 
-        // tools + HITL (W3/W4): якщо модель попросила інструмент — виконати;
-        // перед незворотною дією (створити тікет) спитати людину. поки лише читаємо назву.
-        // TODO(student, W3/W4)
+        // tools (W3): тут лише читаємо, ЩО модель попросила. Виконання — після повного розбору
+        // відповіді (нижче), щоб побічна дія не стартувала на відповіді, яка далі впаде в catch.
+        // Один хоп і перший виклик: mock завжди просить один інструмент. Кілька tool_calls —
+        // окреме рішення (паралельно лише read-only, side-effecting — послідовно), поза core.
         if (message.TryGetProperty("tool_calls", out var tools)
             && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
         {
@@ -96,6 +114,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
         completionTokens = usage.GetProperty("completion_tokens").GetInt32();
         hasUsage = true;
+        ok = true;
     }
     catch
     {
@@ -103,6 +122,23 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         // TODO(student, W4): тут краще graceful degradation
         answer = "Сервіс тимчасово недоступний.";
     }
+
+    // tools (W3): виконуємо інструмент і підклеюємо результат до відповіді (один хоп, без
+    // повторного виклику моделі — спрощення курсу). Невідомий інструмент → не виконуємо, лише лог.
+    // HITL (W4): create_ticket — незворотна дія, зараз виконується автономно; далі → черга /approvals.
+    if (ok && toolCall != null)
+    {
+        var toolResult = RunTool(toolCall);
+        if (toolResult != null) answer += $" ({toolResult})";
+        else app.Logger.LogWarning("unknown tool {Tool}, request_id={RequestId}", toolCall, requestId);
+    }
+
+    // у кеш — лише відповідь, у якій впевнені. Не кешуємо: збій або нерозібрану відповідь
+    // (заглушка «тимчасово недоступний» закріпилась би після відновлення), tool-виклик
+    // (результат = стан зовнішньої системи на момент виклику), резервний промпт "none"
+    // (деградація реєстру), порожню відповідь.
+    if (ok && status == 200 && toolCall == null && promptVersion != "none" && !string.IsNullOrWhiteSpace(answer))
+        cache[cacheKey] = answer;
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
 
@@ -203,6 +239,16 @@ static string Route(string message, string def)
     return escalationMarkers.Any(m => u.Contains(m)) ? "mock-strong" : "mock-mini";
 }
 
+// Мінімальний реєстр інструментів (W3): назва → результат. Заглушки замість CRM/тікет-системи.
+// lookup_order — read-only, повтор безпечний. create_ticket — side-effecting: повтор = ще один тікет,
+// тому потребує ключа ідемпотентності й підтвердження людиною (W4). Невідома назва → null.
+static string? RunTool(string name) => name switch
+{
+    "lookup_order"  => "статус: оплачено, доставку призначено",
+    "create_ticket" => "тікет #T-" + Guid.NewGuid().ToString("N")[..4],
+    _ => null,
+};
+
 // Вартість одного виклику: вхідні й вихідні токени — кожні за своїм тарифом (за 1k).
 // Немає тарифу → null: такі рядки знаходить WHERE cost_usd IS NULL, і прайс правиться як баг.
 // Округлення до 6 знаків = NUMERIC(10,6) у requests. AwayFromZero — як round() у Postgres
@@ -294,3 +340,11 @@ static IResult RegistryUnavailable(ILogger log, Exception ex, Guid requestId)
 }
 
 record ChatIn(string Message);
+
+// Лічильники кешу. Поля, а не властивості: Interlocked.Increment(ref ...) приймає лише поле/змінну.
+// Клас (reference type), щоб лямбди /chat і /observability (W5) бачили той самий екземпляр.
+class CacheStats
+{
+    public long Hits;
+    public long Misses;
+}

@@ -32,6 +32,10 @@ var budgetUsd = 5.0m;
 var cache = new ConcurrentDictionary<string, string>();
 var cacheStats = new CacheStats(); // hit/miss — з них у W5 рахується плитка Cache-hit
 
+// HITL (W4): черга заявок на незворотні дії. У пам'яті процесу, як і кеш: рестарт = черга порожня
+// (свідоме спрощення; у проді — таблиця з durable термінальним станом).
+var approvals = new ConcurrentDictionary<string, Approval>();
+
 // Fallback (W4): лічильник переходів між моделями ланцюга — з нього у W5 живе плитка Fallback.
 var fallbackStats = new FallbackStats();
 
@@ -44,13 +48,15 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): PII маскується ПЕРШИМ рядком — до routing, ключа кешу, виклику моделі й логів.
+    // Нижче body.Message не використовується ніде: лише userMessage.
+    var userMessage = Guards.MaskPii(body.Message);
+
     // budget (W2): умова з лога → дія control plane. Політика — біля Route().
     await CheckBudget(app.Logger, dbConn, budgetUsd);
 
     // routing (W2): ескалація -> сильна модель, решта -> дешева. Політика — у Route().
-    var model = Route(body.Message, defaultModel);
+    var model = Route(userMessage, defaultModel);
 
     string promptVersion, systemPrompt;
     try
@@ -65,7 +71,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // cache (W3): ключ = модель + промпт (версія і текст) + повідомлення.
     // Промпт у ключі: promote/rollback дає інші ключі → старі відповіді недосяжні без коду інвалідації.
     // Текст, а не лише версія: ловить і правку body «на місці» без нової версії.
-    var cacheKey = $"{model}|{promptVersion}|{systemPrompt}|{body.Message}";
+    // W4: з маскованого повідомлення — email не осідає в ключах, а повідомлення, що різняться лише email-ом, дають hit.
+    var cacheKey = $"{model}|{promptVersion}|{systemPrompt}|{userMessage}";
     if (cache.TryGetValue(cacheKey, out var cached))
     {
         Interlocked.Increment(ref cacheStats.Hits);
@@ -93,7 +100,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
             app.Logger.LogWarning("fallback {From} -> {To} after status={Status}, request_id={RequestId}",
                 chain[i - 1], chain[i], r.Status, requestId);
         }
-        r = await CallGateway(http, app.Logger, gateway, chain[i], systemPrompt, body.Message, requestId);
+        r = await CallGateway(http, app.Logger, gateway, chain[i], systemPrompt, userMessage, requestId);
         model = chain[i]; // у лог і в cost — модель, що реально відповіла (або остання спроба)
         if (r.Ok) { ok = true; answeredBy = i; break; }
         if (!IsRetryable(r.Status)) break;
@@ -116,12 +123,26 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
     // tools (W3): виконуємо інструмент і підклеюємо результат до відповіді (один хоп, без
     // повторного виклику моделі — спрощення курсу). Невідомий інструмент → не виконуємо, лише лог.
-    // HITL (W4): create_ticket — незворотна дія, зараз виконується автономно; далі → черга /approvals.
+    // HITL (W4): незворотна дія тут НЕ виконується — стає заявкою в черзі; виконає її лише
+    // POST /approvals/{id}/approve. Рішення «чи потрібне підтвердження» — в одному місці: RequiresApproval().
     if (ok && toolCall != null)
     {
-        var toolResult = RunTool(toolCall);
-        if (toolResult != null) answer += $" ({toolResult})";
-        else app.Logger.LogWarning("unknown tool {Tool}, request_id={RequestId}", toolCall, requestId);
+        if (RequiresApproval(toolCall))
+        {
+            var approvalId = Guid.NewGuid().ToString("N")[..8];
+            approvals[approvalId] = new Approval(toolCall, "pending", null, DateTimeOffset.UtcNow, requestId);
+            app.Logger.LogInformation("approval queued id={ApprovalId} action={Action} request_id={RequestId}",
+                approvalId, toolCall, requestId);
+            // Текст моделі («Створюю тікет…») замінюємо: до approve дії не було, стверджувати її не можна.
+            // Без номерів і id — номер тікета з'явиться лише після approve, у GET /approvals.
+            answer = "Передав ваш запит на створення тікета оператору — тікет буде створено після його підтвердження.";
+        }
+        else
+        {
+            var toolResult = RunTool(toolCall);
+            if (toolResult != null) answer += $" ({toolResult})";
+            else app.Logger.LogWarning("unknown tool {Tool}, request_id={RequestId}", toolCall, requestId);
+        }
     }
 
     // у кеш — лише відповідь, у якій впевнені. Не кешуємо: збій або нерозібрану відповідь
@@ -206,7 +227,49 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+// W4: черга HITL. pending — для картки Approvals у консолі; done — слід виконання (result = номер тікета):
+// без нього «рівно один тікет» неможливо перевірити.
+app.MapGet("/approvals", () =>
+{
+    var all = approvals.ToArray(); // знімок: черга може мінятися під час серіалізації
+    return Results.Json(new
+    {
+        pending = all.Where(p => p.Value.State == "pending")
+            .OrderBy(p => p.Value.CreatedAt)
+            .Select(p => new { id = p.Key, action = p.Value.Action, created_at = p.Value.CreatedAt })
+            .ToArray(),
+        done = all.Where(p => p.Value.State != "pending")
+            .OrderByDescending(p => p.Value.CreatedAt)
+            .Select(p => new { id = p.Key, action = p.Value.Action, state = p.Value.State, result = p.Value.Result })
+            .ToArray(),
+    });
+});
+
+// W4: approve. Check-then-act атомарно: TryUpdate переводить pending → running лише якщо заявка не
+// змінилась між читанням і записом — з двох паралельних approve виграє один, другий отримує 404.
+// Повтор і невідомий id → однаковий 404: відповідь не підказує, які id існують.
+app.MapPost("/approvals/{id}/approve", (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var a) || a.State != "pending"
+        || !approvals.TryUpdate(id, a with { State = "running" }, a)) // record → порівняння за значенням
+        return Results.NotFound(new { error = "already done" });
+
+    try
+    {
+        var result = RunTool(a.Action) ?? "виконано";
+        approvals[id] = a with { State = "approved", Result = result };
+        app.Logger.LogInformation("approval approved id={ApprovalId} action={Action} result={Result} request_id={RequestId}",
+            id, a.Action, result, a.RequestId);
+        return Results.Ok(new { id, action = a.Action, result });
+    }
+    catch (Exception ex)
+    {
+        // термінальний стан, а не вічне running; повторно не виконується (повтор → 404)
+        approvals[id] = a with { State = "failed" };
+        app.Logger.LogError(ex, "approval failed id={ApprovalId} request_id={RequestId}", id, a.RequestId);
+        return Results.Problem("tool failed", statusCode: 500);
+    }
+});
 
 app.Run("http://0.0.0.0:8080");
 
@@ -307,13 +370,17 @@ static async Task<GatewayResult> CallGateway(HttpClient http, ILogger log, strin
 
 // Мінімальний реєстр інструментів (W3): назва → результат. Заглушки замість CRM/тікет-системи.
 // lookup_order — read-only, повтор безпечний. create_ticket — side-effecting: повтор = ще один тікет,
-// тому потребує ключа ідемпотентності й підтвердження людиною (W4). Невідома назва → null.
+// тому йде через HITL-чергу (W4, RequiresApproval). Невідома назва → null.
 static string? RunTool(string name) => name switch
 {
     "lookup_order"  => "статус: оплачено, доставку призначено",
     "create_ticket" => "тікет #T-" + Guid.NewGuid().ToString("N")[..4],
     _ => null,
 };
+
+// HITL-гейт (W4): ЄДИНЕ місце, де вирішується «чи потрібне підтвердження людини».
+// Незворотні (side-effecting) дії — так, read-only — ні. Новий незворотний інструмент = рядок тут.
+static bool RequiresApproval(string tool) => tool is "create_ticket";
 
 // Вартість одного виклику: вхідні й вихідні токени — кожні за своїм тарифом (за 1k).
 // Немає тарифу → null: такі рядки знаходить WHERE cost_usd IS NULL, і прайс правиться як баг.
@@ -423,4 +490,7 @@ class FallbackStats
 }
 
 // Результат однієї спроби виклику моделі (W4). Status = 0 — HTTP-відповіді не було.
+// Заявка HITL (W4). State: pending → running → approved | failed. Record — щоб TryUpdate порівнював за значенням.
+record Approval(string Action, string State, string? Result, DateTimeOffset CreatedAt, Guid RequestId);
+
 record GatewayResult(bool Ok, int Status, string Answer, string? Tool, int PromptTokens, int CompletionTokens);

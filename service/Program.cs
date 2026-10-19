@@ -32,18 +32,31 @@ var budgetUsd = 5.0m;
 var cache = new ConcurrentDictionary<string, string>();
 var cacheStats = new CacheStats(); // hit/miss — з них у W5 рахується плитка Cache-hit
 
+// HITL (W4): черга заявок на незворотні дії. У пам'яті процесу, як і кеш: рестарт = черга порожня
+// (свідоме спрощення; у проді — таблиця з durable термінальним станом).
+var approvals = new ConcurrentDictionary<string, Approval>();
+
+// Fallback (W4): лічильник переходів між моделями ланцюга — з нього у W5 живе плитка Fallback.
+var fallbackStats = new FallbackStats();
+
+// Graceful degradation (W4): усі моделі ланцюга впали. Чесно і без предметних фактів —
+// ні статусу замовлення, ні тікета, ні «зроблено», ні цифр: заглушка не має права щось стверджувати.
+const string DegradedAnswer = "Вибачте, у нас тимчасова технічна проблема. Спробуйте, будь ласка, трохи згодом.";
+
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
     var requestId = Guid.NewGuid();
     var startedAt = DateTimeOffset.UtcNow;
 
-    // guardrails (W4): тут перевірити вхід на PII / інʼєкції. поки нічого.
-    // TODO(student, W4)
+    // guardrails (W4): PII маскується ПЕРШИМ рядком — до routing, ключа кешу, виклику моделі й логів.
+    // Нижче body.Message не використовується ніде: лише userMessage.
+    var userMessage = Guards.MaskPii(body.Message);
+
     // budget (W2): умова з лога → дія control plane. Політика — біля Route().
     await CheckBudget(app.Logger, dbConn, budgetUsd);
 
     // routing (W2): ескалація -> сильна модель, решта -> дешева. Політика — у Route().
-    var model = Route(body.Message, defaultModel);
+    var model = Route(userMessage, defaultModel);
 
     string promptVersion, systemPrompt;
     try
@@ -58,7 +71,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // cache (W3): ключ = модель + промпт (версія і текст) + повідомлення.
     // Промпт у ключі: promote/rollback дає інші ключі → старі відповіді недосяжні без коду інвалідації.
     // Текст, а не лише версія: ловить і правку body «на місці» без нової версії.
-    var cacheKey = $"{model}|{promptVersion}|{systemPrompt}|{body.Message}";
+    // W4: з маскованого повідомлення — email не осідає в ключах, а повідомлення, що різняться лише email-ом, дають hit.
+    var cacheKey = $"{model}|{promptVersion}|{systemPrompt}|{userMessage}";
     if (cache.TryGetValue(cacheKey, out var cached))
     {
         Interlocked.Increment(ref cacheStats.Hits);
@@ -69,75 +83,75 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     }
     Interlocked.Increment(ref cacheStats.Misses);
 
-    // fallback (W4): якщо тут 429/5xx — піти на іншого провайдера. поки один виклик.
-    // TODO(student, W4)
-    var payload = JsonSerializer.Serialize(new
-    {
-        model,
-        messages = new object[]
-        {
-            new { role = "system", content = systemPrompt },
-            new { role = "user", content = body.Message }
-        }
-    });
-
+    // fallback (W4): ідемо по ланцюгу з Chain() (політика — біля Route()). Збій спроби —
+    // 429/5xx, таймаут, мережа або нерозбірна відповідь → наступна модель; кожен перехід
+    // рахується у fallbackStats. Інші 4xx (400/401/404) — помилка запиту чи конфігу:
+    // інша модель її не виправить, тому ланцюг обривається одразу.
     var http = httpFactory.CreateClient();
-    var answer = "";
-    string? toolCall = null;
-    int promptTokens = 0, completionTokens = 0, status = 0; // 0 = відповіді не було
-    var hasUsage = false; // true лише коли провайдер повернув usage → вартість можна порахувати
-    var ok = false;       // true лише коли відповідь розібрана повністю (останній рядок try)
-
-    try
+    var chain = Chain(model);
+    var r = new GatewayResult(false, 0, "", null, 0, 0);
+    var ok = false;
+    var answeredBy = -1; // індекс моделі, що відповіла; 0 = основна
+    for (var i = 0; i < chain.Length; i++)
     {
-        var response = await http.PostAsync(
-            $"{gateway}/v1/chat/completions",
-            new StringContent(payload, Encoding.UTF8, "application/json"));
-        status = (int)response.StatusCode;
-        var rawJson = await response.Content.ReadAsStringAsync();
-
-        using var doc = JsonDocument.Parse(rawJson);
-        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
-        answer = message.GetProperty("content").GetString() ?? "";
-
-        // tools (W3): тут лише читаємо, ЩО модель попросила. Виконання — після повного розбору
-        // відповіді (нижче), щоб побічна дія не стартувала на відповіді, яка далі впаде в catch.
-        // Один хоп і перший виклик: mock завжди просить один інструмент. Кілька tool_calls —
-        // окреме рішення (паралельно лише read-only, side-effecting — послідовно), поза core.
-        if (message.TryGetProperty("tool_calls", out var tools)
-            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        if (i > 0)
         {
-            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+            Interlocked.Increment(ref fallbackStats.Transitions);
+            app.Logger.LogWarning("fallback {From} -> {To} after status={Status}, request_id={RequestId}",
+                chain[i - 1], chain[i], r.Status, requestId);
         }
-
-        var usage = doc.RootElement.GetProperty("usage");
-        promptTokens = usage.GetProperty("prompt_tokens").GetInt32();
-        completionTokens = usage.GetProperty("completion_tokens").GetInt32();
-        hasUsage = true;
-        ok = true;
+        r = await CallGateway(http, app.Logger, gateway, chain[i], systemPrompt, userMessage, requestId);
+        model = chain[i]; // у лог і в cost — модель, що реально відповіла (або остання спроба)
+        if (r.Ok) { ok = true; answeredBy = i; break; }
+        if (!IsRetryable(r.Status)) break;
     }
-    catch
+
+    var answer = r.Answer;
+    var toolCall = r.Tool;
+    var status = r.Status;
+
+    if (!ok)
     {
-        // мережа/gateway недоступні або відповідь не розпарсилась (status лишиться 0/5xx).
-        // TODO(student, W4): тут краще graceful degradation
-        answer = "Сервіс тимчасово недоступний.";
+        // graceful degradation (W4): клієнту — HTTP 200 і чесна заглушка. У requests — статус збою,
+        // а не 200: інакше error rate (W5) не побачить інциденту. 0 (таймаут/мережа) і 2xx
+        // з нерозбірним тілом → 503, бо HTTP-статусу, що описує збій, немає.
+        answer = DegradedAnswer;
+        if (status is 0 or (>= 200 and < 300)) status = 503;
+        app.Logger.LogWarning("all models failed, degraded answer, chain={Chain} status={Status} request_id={RequestId}",
+            string.Join(" -> ", chain), status, requestId);
     }
 
     // tools (W3): виконуємо інструмент і підклеюємо результат до відповіді (один хоп, без
     // повторного виклику моделі — спрощення курсу). Невідомий інструмент → не виконуємо, лише лог.
-    // HITL (W4): create_ticket — незворотна дія, зараз виконується автономно; далі → черга /approvals.
+    // HITL (W4): незворотна дія тут НЕ виконується — стає заявкою в черзі; виконає її лише
+    // POST /approvals/{id}/approve. Рішення «чи потрібне підтвердження» — в одному місці: RequiresApproval().
     if (ok && toolCall != null)
     {
-        var toolResult = RunTool(toolCall);
-        if (toolResult != null) answer += $" ({toolResult})";
-        else app.Logger.LogWarning("unknown tool {Tool}, request_id={RequestId}", toolCall, requestId);
+        if (RequiresApproval(toolCall))
+        {
+            var approvalId = Guid.NewGuid().ToString("N")[..8];
+            approvals[approvalId] = new Approval(toolCall, "pending", null, DateTimeOffset.UtcNow, requestId);
+            app.Logger.LogInformation("approval queued id={ApprovalId} action={Action} request_id={RequestId}",
+                approvalId, toolCall, requestId);
+            // Текст моделі («Створюю тікет…») замінюємо: до approve дії не було, стверджувати її не можна.
+            // Без номерів і id — номер тікета з'явиться лише після approve, у GET /approvals.
+            answer = "Передав ваш запит на створення тікета оператору — тікет буде створено після його підтвердження.";
+        }
+        else
+        {
+            var toolResult = RunTool(toolCall);
+            if (toolResult != null) answer += $" ({toolResult})";
+            else app.Logger.LogWarning("unknown tool {Tool}, request_id={RequestId}", toolCall, requestId);
+        }
     }
 
     // у кеш — лише відповідь, у якій впевнені. Не кешуємо: збій або нерозібрану відповідь
     // (заглушка «тимчасово недоступний» закріпилась би після відновлення), tool-виклик
     // (результат = стан зовнішньої системи на момент виклику), резервний промпт "none"
-    // (деградація реєстру), порожню відповідь.
-    if (ok && status == 200 && toolCall == null && promptVersion != "none" && !string.IsNullOrWhiteSpace(answer))
+    // (деградація реєстру), порожню відповідь. W4: і відповідь резервної моделі (answeredBy > 0) —
+    // ключ рахується з основної моделі, тож відповідь резерву закріпилась би під ним і після відновлення.
+    if (ok && answeredBy == 0 && status == 200 && toolCall == null && promptVersion != "none"
+        && !string.IsNullOrWhiteSpace(answer))
         cache[cacheKey] = answer;
 
     var latencyMs = (int)(DateTimeOffset.UtcNow - startedAt).TotalMilliseconds;
@@ -145,10 +159,11 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // cost (W2): usage → тариф моделі → cost_usd. Вартість відома лише після відповіді.
     // null = невідомо (usage не прийшов або моделі немає в прайсі). Це не 0:
     // 0 = «виклик нічого не коштував», легально лише для cache hit (W3).
-    var costUsd = hasUsage ? CostUsd(prices, model, promptTokens, completionTokens) : null;
+    // W4: usage є лише в успішної спроби (r.Ok); тариф — моделі, що реально відповіла.
+    var costUsd = ok ? CostUsd(prices, model, r.PromptTokens, r.CompletionTokens) : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
-    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, promptTokens, completionTokens, costUsd, status);
+    await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, r.PromptTokens, r.CompletionTokens, costUsd, status);
 
     return Results.Json(new { request_id = requestId, content = answer, tool = toolCall, latency_ms = latencyMs });
 });
@@ -212,7 +227,49 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
 });
 
 app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
-app.MapGet("/approvals", () => Results.Json(new { todo = "pending HITL approvals" }));              // W4: { pending: [ { id, action } ] }
+// W4: черга HITL. pending — для картки Approvals у консолі; done — слід виконання (result = номер тікета):
+// без нього «рівно один тікет» неможливо перевірити.
+app.MapGet("/approvals", () =>
+{
+    var all = approvals.ToArray(); // знімок: черга може мінятися під час серіалізації
+    return Results.Json(new
+    {
+        pending = all.Where(p => p.Value.State == "pending")
+            .OrderBy(p => p.Value.CreatedAt)
+            .Select(p => new { id = p.Key, action = p.Value.Action, created_at = p.Value.CreatedAt })
+            .ToArray(),
+        done = all.Where(p => p.Value.State != "pending")
+            .OrderByDescending(p => p.Value.CreatedAt)
+            .Select(p => new { id = p.Key, action = p.Value.Action, state = p.Value.State, result = p.Value.Result })
+            .ToArray(),
+    });
+});
+
+// W4: approve. Check-then-act атомарно: TryUpdate переводить pending → running лише якщо заявка не
+// змінилась між читанням і записом — з двох паралельних approve виграє один, другий отримує 404.
+// Повтор і невідомий id → однаковий 404: відповідь не підказує, які id існують.
+app.MapPost("/approvals/{id}/approve", (string id) =>
+{
+    if (!approvals.TryGetValue(id, out var a) || a.State != "pending"
+        || !approvals.TryUpdate(id, a with { State = "running" }, a)) // record → порівняння за значенням
+        return Results.NotFound(new { error = "already done" });
+
+    try
+    {
+        var result = RunTool(a.Action) ?? "виконано";
+        approvals[id] = a with { State = "approved", Result = result };
+        app.Logger.LogInformation("approval approved id={ApprovalId} action={Action} result={Result} request_id={RequestId}",
+            id, a.Action, result, a.RequestId);
+        return Results.Ok(new { id, action = a.Action, result });
+    }
+    catch (Exception ex)
+    {
+        // термінальний стан, а не вічне running; повторно не виконується (повтор → 404)
+        approvals[id] = a with { State = "failed" };
+        app.Logger.LogError(ex, "approval failed id={ApprovalId} request_id={RequestId}", id, a.RequestId);
+        return Results.Problem("tool failed", statusCode: 500);
+    }
+});
 
 app.Run("http://0.0.0.0:8080");
 
@@ -221,10 +278,8 @@ app.Run("http://0.0.0.0:8080");
 // Маркери — UA-основи + EN, бо роутер на одній мові = половина роутера.
 // Реальна модель у MODEL -> поки без маршрутизації (gpt-5-mini/gpt-5 — наступний крок).
 //
-// fallback chain: mock-strong -> mock-mini -> контрольована помилка (503 з request_id)
-// fallback chain: mock-mini   -> контрольована помилка
-// Механізм — W4 (Тема 7). mock-strong і mock-mini ведуть на один mock-provider,
-// тож це перевірка логіки перемикання, а не справжній резерв.
+// fallback chain (W4) — див. Chain() нижче. mock-strong і mock-mini ведуть на один
+// mock-provider, тож це перевірка логіки перемикання, а не справжній резерв.
 //
 // budget policy (80% денного бюджету): алерт — warning у лог сервісу (у проді — черговому), маршрути не змінюємо.
 // Чому не деградація: звичайні запити й так ідуть на mock-mini, тож деградувати можна лише
@@ -239,15 +294,93 @@ static string Route(string message, string def)
     return escalationMarkers.Any(m => u.Contains(m)) ? "mock-strong" : "mock-mini";
 }
 
+// Fallback-ланцюг (W4): основна модель → резерв → (усі впали) graceful degradation.
+//   mock-strong -> mock-mini   : ескалація не лишається без відповіді; резерв ще й дешевший.
+//   mock-mini   -> mock-strong : дорожче, але відповідь важливіша за центи (та сама логіка, що в budget policy).
+//   реальна     -> інша родина : резерв в іншого провайдера = інший домен відмови (потрібні обидва ключі).
+// Retry тієї самої моделі свідомо не робимо (рішення L07): при 429 у проді тут стояв би backoff.
+static string[] Chain(string primary) => primary switch
+{
+    "mock-strong" => new[] { "mock-strong", "mock-mini" },
+    "mock-mini"   => new[] { "mock-mini", "mock-strong" },
+    _             => new[] { primary, primary.StartsWith("claude") ? "gpt-5-mini" : "claude-haiku" },
+};
+
+// Чи має сенс іти на наступну модель: так — 429, 5xx, 0 (таймаут/мережа), 2xx з нерозбірним тілом.
+// Ні — решта 4xx: це помилка запиту чи конфігу, інша модель її не виправить.
+static bool IsRetryable(int status) => status == 429 || status is not (>= 400 and < 500);
+
+// Одна спроба виклику моделі через gateway. Збій — значення (Ok=false), а не виняток:
+// ланцюг у /chat вирішує, що робити далі. Таймаут на спробу 5 с: __delay (2 с) проходить,
+// два елементи ланцюга вкладаються в 10 с — менше за таймаут evals (30 с).
+// Тіло запиту/відповіді не логуємо (там повідомлення користувача) — лише тип збою, модель і request_id.
+static async Task<GatewayResult> CallGateway(HttpClient http, ILogger log, string gateway, string model,
+    string systemPrompt, string userMessage, Guid requestId)
+{
+    var payload = JsonSerializer.Serialize(new
+    {
+        model,
+        messages = new object[]
+        {
+            new { role = "system", content = systemPrompt },
+            new { role = "user", content = userMessage }
+        }
+    });
+
+    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+    var status = 0; // 0 = HTTP-відповіді не було
+    try
+    {
+        using var response = await http.PostAsync(
+            $"{gateway}/v1/chat/completions",
+            new StringContent(payload, Encoding.UTF8, "application/json"), cts.Token);
+        status = (int)response.StatusCode;
+        if (!response.IsSuccessStatusCode)
+        {
+            log.LogWarning("gateway status={Status} model={Model} request_id={RequestId}", status, model, requestId);
+            return new GatewayResult(false, status, "", null, 0, 0);
+        }
+
+        var rawJson = await response.Content.ReadAsStringAsync(cts.Token);
+        using var doc = JsonDocument.Parse(rawJson);
+        var message = doc.RootElement.GetProperty("choices")[0].GetProperty("message");
+        var answer = message.GetProperty("content").GetString() ?? "";
+
+        // tools (W3): тут лише читаємо, ЩО модель попросила. Виконання — у /chat після ланцюга,
+        // щоб побічна дія не стартувала на відповіді, яка ще може впасти на розборі.
+        // Один хоп і перший виклик: mock завжди просить один інструмент.
+        string? toolCall = null;
+        if (message.TryGetProperty("tool_calls", out var tools)
+            && tools.ValueKind == JsonValueKind.Array && tools.GetArrayLength() > 0)
+        {
+            toolCall = tools[0].GetProperty("function").GetProperty("name").GetString();
+        }
+
+        var usage = doc.RootElement.GetProperty("usage");
+        return new GatewayResult(true, status, answer, toolCall,
+            usage.GetProperty("prompt_tokens").GetInt32(), usage.GetProperty("completion_tokens").GetInt32());
+    }
+    catch (Exception ex) // таймаут (TaskCanceledException), мережа, нерозбірний JSON
+    {
+        log.LogWarning("gateway call failed: {Error} status={Status} model={Model} request_id={RequestId}",
+            ex.GetType().Name, status, model, requestId);
+        return new GatewayResult(false, status, "", null, 0, 0);
+    }
+}
+
 // Мінімальний реєстр інструментів (W3): назва → результат. Заглушки замість CRM/тікет-системи.
 // lookup_order — read-only, повтор безпечний. create_ticket — side-effecting: повтор = ще один тікет,
-// тому потребує ключа ідемпотентності й підтвердження людиною (W4). Невідома назва → null.
+// тому йде через HITL-чергу (W4, RequiresApproval). Невідома назва → null.
 static string? RunTool(string name) => name switch
 {
     "lookup_order"  => "статус: оплачено, доставку призначено",
     "create_ticket" => "тікет #T-" + Guid.NewGuid().ToString("N")[..4],
     _ => null,
 };
+
+// HITL-гейт (W4): ЄДИНЕ місце, де вирішується «чи потрібне підтвердження людини».
+// Незворотні (side-effecting) дії — так, read-only — ні. Новий незворотний інструмент = рядок тут.
+static bool RequiresApproval(string tool) => tool is "create_ticket";
 
 // Вартість одного виклику: вхідні й вихідні токени — кожні за своїм тарифом (за 1k).
 // Немає тарифу → null: такі рядки знаходить WHERE cost_usd IS NULL, і прайс правиться як баг.
@@ -348,3 +481,16 @@ class CacheStats
     public long Hits;
     public long Misses;
 }
+
+// Лічильник переходів між моделями ланцюга (W4) → fallback_events у /observability (W5).
+// Поле і клас — з тих самих причин, що й CacheStats.
+class FallbackStats
+{
+    public long Transitions;
+}
+
+// Результат однієї спроби виклику моделі (W4). Status = 0 — HTTP-відповіді не було.
+// Заявка HITL (W4). State: pending → running → approved | failed. Record — щоб TryUpdate порівнював за значенням.
+record Approval(string Action, string State, string? Result, DateTimeOffset CreatedAt, Guid RequestId);
+
+record GatewayResult(bool Ok, int Status, string Answer, string? Tool, int PromptTokens, int CompletionTokens);

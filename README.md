@@ -28,3 +28,18 @@ docker compose up --build
 Піднімаються: UI (`:4200`), сервіс (`:8080`), LiteLLM (`:4000`), Postgres, mock provider.
 Для mock реальні ключі не потрібні. Redis і дашборди — опційні: `docker compose --profile advanced up`.
 Для оцінки якості (model-based evals): `cp gateway/.env.example gateway/.env` і заповнити ключі.
+
+## SLO (W5)
+
+SLI — частка звернень зі змістовною відповіддю: `status = '200'` у `requests`.
+Заглушка деградації пишеться як 503/429, чесна відповідь на сміття — як 502, тож обидві
+рахуються невдачею, хоча клієнт отримав HTTP 200.
+
+SLO — **99% за тиждень**. При 10 000 звернень/тиждень бюджет помилок — **100 невдач**.
+Бюджет спалено до кінця тижня → заморозка релізів промптів/моделей, лише стабільність.
+
+```sql
+SELECT round(100.0 * count(*) FILTER (WHERE status = '200') / count(*), 2) AS sli_pct,
+       count(*) FILTER (WHERE status <> '200') AS failures
+FROM requests WHERE created_at > now() - interval '7 days';
+```

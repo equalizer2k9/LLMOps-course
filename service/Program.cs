@@ -23,6 +23,11 @@ var prices = new Dictionary<string, (decimal InPer1K, decimal OutPer1K)>
     ["mock-mini"]   = (0.00015m, 0.0006m),
     ["mock-strong"] = (0.0025m,  0.01m),
 };
+// W5: послідовні збої на модель → статус провайдера для консолі. Seed з прайсу — картка
+// не «—» до першого запиту. 3 = рівно стільки, скільки ментор робить __fail_503 поспіль
+// (кожен валить обидві моделі ланцюга → кожна +1).
+const int DegradedAfter = 3;
+var providerFails = new ConcurrentDictionary<string, int>(prices.Keys.Select(k => KeyValuePair.Create(k, 0)));
 
 // Денний бюджет (W2). Константа — свідоме спрощення курсу. Лежить поруч із прайсом: той самий control plane.
 var budgetUsd = 5.0m;
@@ -42,6 +47,9 @@ var fallbackStats = new FallbackStats();
 // Graceful degradation (W4): усі моделі ланцюга впали. Чесно і без предметних фактів —
 // ні статусу замовлення, ні тікета, ні «зроблено», ні цифр: заглушка не має права щось стверджувати.
 const string DegradedAnswer = "Вибачте, у нас тимчасова технічна проблема. Спробуйте, будь ласка, трохи згодом.";
+// W5: модель відповіла 200, але без змісту (урок 1: сміття = збій формату). Текст свідомо
+// інший, ніж DegradedAnswer: eval має розрізняти «система лежить» і «відповідь непридатна».
+const string GarbageAnswer = "Не вдалося сформувати змістовну відповідь. Переформулюйте, будь ласка, питання або попросіть з'єднати з оператором.";
 
 app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 {
@@ -92,6 +100,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     var r = new GatewayResult(false, 0, "", null, 0, 0);
     var ok = false;
     var answeredBy = -1; // індекс моделі, що відповіла; 0 = основна
+    var garbage = false; // W5: остання спроба — 200 без змісту
     for (var i = 0; i < chain.Length; i++)
     {
         if (i > 0)
@@ -101,7 +110,19 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
                 chain[i - 1], chain[i], r.Status, requestId);
         }
         r = await CallGateway(http, app.Logger, gateway, chain[i], systemPrompt, userMessage, requestId);
-        model = chain[i]; // у лог і в cost — модель, що реально відповіла (або остання спроба)
+        model = chain[i];
+
+        // W5: 200 без змісту = збій спроби, як нерозбірний JSON → наступна модель.
+        // ДО providerFails: сміття — теж ознака нездоров'я моделі.
+        garbage = r.Ok && IsGarbage(r);
+        if (garbage)
+        {
+            app.Logger.LogWarning("garbage answer model={Model} request_id={RequestId}", chain[i], requestId);
+            r = r with { Ok = false, Status = 502 }; // upstream віддав непридатну відповідь; 502 retryable
+        }
+
+        if (r.Ok) providerFails[chain[i]] = 0;
+        else if (IsRetryable(r.Status)) providerFails.AddOrUpdate(chain[i], 1, (_, n) => n + 1);
         if (r.Ok) { ok = true; answeredBy = i; break; }
         if (!IsRetryable(r.Status)) break;
     }
@@ -115,7 +136,7 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
         // graceful degradation (W4): клієнту — HTTP 200 і чесна заглушка. У requests — статус збою,
         // а не 200: інакше error rate (W5) не побачить інциденту. 0 (таймаут/мережа) і 2xx
         // з нерозбірним тілом → 503, бо HTTP-статусу, що описує збій, немає.
-        answer = DegradedAnswer;
+        answer = garbage ? GarbageAnswer : DegradedAnswer;
         if (status is 0 or (>= 200 and < 300)) status = 503;
         app.Logger.LogWarning("all models failed, degraded answer, chain={Chain} status={Status} request_id={RequestId}",
             string.Join(" -> ", chain), status, requestId);
@@ -159,8 +180,8 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
     // cost (W2): usage → тариф моделі → cost_usd. Вартість відома лише після відповіді.
     // null = невідомо (usage не прийшов або моделі немає в прайсі). Це не 0:
     // 0 = «виклик нічого не коштував», легально лише для cache hit (W3).
-    // W4: usage є лише в успішної спроби (r.Ok); тариф — моделі, що реально відповіла.
-    var costUsd = ok ? CostUsd(prices, model, r.PromptTokens, r.CompletionTokens) : null;
+    // W5: за сміття токени реально витрачені → рахуємо (лише останньої спроби — спрощення)
+    var costUsd = ok || garbage ? CostUsd(prices, model, r.PromptTokens, r.CompletionTokens) : null;
 
     // лог кожного запиту — з цього живе observability (W1) і cost (W2)
     await LogRequest(dbConn, requestId, model, promptVersion, latencyMs, r.PromptTokens, r.CompletionTokens, costUsd, status);
@@ -170,7 +191,44 @@ app.MapPost("/chat", async (ChatIn body, IHttpClientFactory httpFactory) =>
 
 // ці ендпоінти читає готова консоль. поверни потрібну форму — картки оживуть.
 app.MapGet("/health", () => Results.Ok(new { status = "ok" }));                                    // ліфнес, не для консолі
-app.MapGet("/observability", () => Results.Json(new { todo = "aggregate from requests table" }));  // W5: { p95_ms, requests, cache_hit_pct, error_rate_pct, fallback_events }
+
+// W5: requests / p95 / error rate — з БД (переживають рестарт); cache-hit і fallback — з пам'яті процесу.
+// COALESCE: на порожній таблиці percentile_cont і AVG повертають NULL → читання в double/decimal = 500.
+app.MapGet("/observability", async () =>
+{
+    try
+    {
+        await using var db = new NpgsqlConnection(dbConn);
+        await db.OpenAsync();
+        await using var cmd = new NpgsqlCommand(
+            "SELECT count(*), "
+            + "COALESCE(percentile_cont(0.95) WITHIN GROUP (ORDER BY latency_ms), 0), "
+            + "COALESCE(AVG(CASE WHEN status <> '200' THEN 1.0 ELSE 0 END) * 100, 0) "
+            + "FROM requests WHERE created_at::date = CURRENT_DATE", db);
+        await using var rd = await cmd.ExecuteReaderAsync();
+        await rd.ReadAsync();
+        var requests  = rd.GetInt64(0);    // count(*)        → bigint
+        var p95       = rd.GetDouble(1);   // percentile_cont → double precision
+        var errorRate = rd.GetDecimal(2);  // AVG(numeric)    → numeric
+
+        var hits  = Interlocked.Read(ref cacheStats.Hits);
+        var total = hits + Interlocked.Read(ref cacheStats.Misses);
+        return Results.Json(new
+        {
+            p95_ms = (int)Math.Round(p95),   // Round, не (int): ментор звіряє з round(...) у SQL, допуск ±1 мс
+            requests,
+            cache_hit_pct = total == 0 ? 0 : Math.Round(hits * 100.0 / total, 1),
+            error_rate_pct = Math.Round(errorRate, 1),
+            fallback_events = Interlocked.Read(ref fallbackStats.Transitions),
+        });
+    }
+    catch (Exception ex) // як у /cost: БД лежить → 503, а не нулі (нулі = «спокійна система» посеред інциденту)
+    {
+        app.Logger.LogError(ex, "observability query failed");
+        return Results.Problem("Observability data unavailable", statusCode: 503);
+    }
+});
+
 app.MapGet("/cost", async () =>
 {
     try
@@ -226,7 +284,14 @@ app.MapPost("/prompts/{version}/activate", async (string version) =>
     }
 });
 
-app.MapGet("/providers", () => Results.Json(new { todo = "provider health" }));                    // W5: { providers: [ { name, status } ] }
+// W5: чесний статус із результатів ланцюга, а не константа "ok" (вона бреше саме під час інциденту).
+// Cache hit статус не оновлює: виклику моделі не було.
+app.MapGet("/providers", () => Results.Json(new
+{
+    providers = providerFails.OrderBy(p => p.Key)
+        .Select(p => new { name = p.Key, status = p.Value >= DegradedAfter ? "degraded" : "ok" }),
+}));
+
 // W4: черга HITL. pending — для картки Approvals у консолі; done — слід виконання (result = номер тікета):
 // без нього «рівно один тікет» неможливо перевірити.
 app.MapGet("/approvals", () =>
@@ -309,6 +374,10 @@ static string[] Chain(string primary) => primary switch
 // Чи має сенс іти на наступну модель: так — 429, 5xx, 0 (таймаут/мережа), 2xx з нерозбірним тілом.
 // Ні — решта 4xx: це помилка запиту чи конфігу, інша модель її не виправить.
 static bool IsRetryable(int status) => status == 429 || status is not (>= 400 and < 500);
+
+// W5: сміття = менше 3 літер/цифр і без tool-виклику. Tool без тексту — легально
+// (у реальних моделей content при tool_calls часто порожній).
+static bool IsGarbage(GatewayResult r) => r.Tool is null && r.Answer.Count(char.IsLetterOrDigit) < 3;
 
 // Одна спроба виклику моделі через gateway. Збій — значення (Ok=false), а не виняток:
 // ланцюг у /chat вирішує, що робити далі. Таймаут на спробу 5 с: __delay (2 с) проходить,

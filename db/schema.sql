@@ -29,6 +29,6 @@ CREATE INDEX IF NOT EXISTS idx_requests_created_at ON requests (created_at);
 CREATE INDEX IF NOT EXISTS idx_requests_model ON requests (model);
 
 INSERT INTO prompts (name, version, body, active) VALUES
-  ('support-system', 'v1', 'You are an assistant.', false),
-  ('support-system', 'v2', 'You are a support assistant. Be concise and helpful.', true)
+  ('support-system', 'v1', 'You are an assistant.', true),
+  ('support-system', 'v2', 'You are a support assistant. Be concise and helpful.', false)
 ON CONFLICT (name, version) DO NOTHING;
